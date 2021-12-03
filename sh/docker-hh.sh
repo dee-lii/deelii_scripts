@@ -18,7 +18,7 @@ docker pull portainer/portainer  >>  portainerSetup.log
 successOf
 echo  "---------------->下载指定portainer镜像<------------------"
 #下载汉化包
-wget  https://o.dqy.ink/Portainer-CN.zip >>  portainerSetup.log
+wget  https://cdn.jsdelivr.net/gh/dee-lii/deelii_scripts/file/Portainer-CN.zip >>  portainerSetup.log
 successOf
 echo  "---------------->下载portainer汉化包成功<------------------"
 #解压缩
