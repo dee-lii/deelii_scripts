@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>太极——纯CSS</title>
+    <style>
+        body {
+            background: rgb(155, 202, 228);
+        }
+
+        .taiji {
+            margin: auto;
+            margin-top: 25vh;
+            width: 400px;
+            height: 400px;
+            border-width: 1px 1px 200px 1px;
+            border-color: black;
+            border-style: solid;
+            box-sizing: border-box;
+            border-radius: 50%;
+            background: white;
+            position: relative;
+            animation: rotate 5s linear infinite;
+        }
+
+        .taiji::before {
+            content: '';
+            position: absolute;
+            border-radius: 50%;
+            width: 50%;
+            height: 100%;
+            left: 0;
+            top: 50%;
+            box-sizing: border-box;
+            border: 80px solid white;
+            background: black;
+        }
+
+        .taiji::after {
+            content: '';
+            position: absolute;
+            border-radius: 50%;
+            box-sizing: border-box;
+            border: 80px solid black;
+            background: white;
+            width: 50%;
+            height: 100%;
+            right: 0;
+            top: 50%;
+        }
+
+        @keyframes rotate {
+            0% {
+                transform: rotate(0deg) translateZ(0);
+            }
+
+            100% {
+                transform: rotate(360deg) translateZ(0);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="taiji"></div>
+</body>
+
+</html>
