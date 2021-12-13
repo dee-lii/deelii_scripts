@@ -15,13 +15,19 @@
   */  
   
 }   
-    .card {
-    background: #fff;
+
+  body { background:url(https://cdn.jsdelivr.net/gh/dee-lii/deelii_scripts/img/tkbjt.jpg);
+    background-repeat:no-repeat;
+    background-size:100% 100%;
+  }
+
+  .card {
+    background: rgba(255, 255, 255, 0.295);
     background-size: contain;
     text-align: center;
     padding: 1em;
   }
-  
+
   .card h1 {
     font-size: 20px;
     margin: 5px auto 0;
