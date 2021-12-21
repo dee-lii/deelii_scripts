@@ -16,7 +16,11 @@
   
 }   
 
+<<<<<<< HEAD
   body { background:url(https://gitee.com/deelii/deelii_scripts/raw/main/img/tkbjt.jpg);
+=======
+  body { background:url(https://gitee.com/deelii/deelii_scripts/raw/master/img/tkbjt.jpg);
+>>>>>>> dc71c548788b316b80b9b41a714d3f0c1d357674
     background-repeat:no-repeat;
     background-size:100% 100%;
   }
