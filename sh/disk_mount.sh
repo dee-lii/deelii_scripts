@@ -2,7 +2,7 @@
 
 #===============================================================================
 # 硬盘挂载脚本 (通用版)
-# 功能：检测未使用的硬盘，格式化并挂载到指定路径
+# 功能：检测未使用的硬盘，支持直接挂载或格式化后挂载
 # 兼容：CentOS/RHEL 6+, Ubuntu 14.04+, Debian 8+, Alpine, SUSE 等主流发行版
 #===============================================================================
 
@@ -11,6 +11,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
+
+NEED_FORMAT=false
+PARTITION=""
+SELECTED_DISK=""
+MOUNT_PATH=""
+FSTYPE=""
 
 print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -58,7 +64,7 @@ check_dependencies() {
     print_info "检查依赖工具..."
     
     local missing_tools=()
-    local required_tools=("lsblk" "blkid" "mkfs.ext4" "mount" "grep" "awk")
+    local required_tools=("lsblk" "blkid" "mount" "grep" "awk")
     
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" &> /dev/null; then
@@ -66,16 +72,12 @@ check_dependencies() {
         fi
     done
     
-    if ! command -v parted &> /dev/null && ! command -v fdisk &> /dev/null; then
-        missing_tools+=("parted 或 fdisk")
-    fi
-    
     if [[ ${#missing_tools[@]} -gt 0 ]]; then
         print_error "缺少以下工具: ${missing_tools[*]}"
         echo ""
         print_info "请根据您的系统安装缺失的工具:"
         echo ""
-        echo "  CentOS/RHEL:  yum install -y util-linux e2fsprogs parted"
+        echo "  CentOS/RHEL:   yum install -y util-linux e2fsprogs parted"
         echo "  Ubuntu/Debian: apt install -y util-linux e2fsprogs parted"
         echo "  Alpine:        apk add util-linux e2fsprogs parted"
         echo "  SUSE:          zypper install -y util-linux e2fsprogs parted"
@@ -87,26 +89,43 @@ check_dependencies() {
         USE_PARTED=true
     else
         USE_PARTED=false
-        print_warning "未找到 parted，将使用 fdisk (仅支持 MBR 分区表)"
     fi
     
     print_success "依赖检查通过"
 }
 
-get_unmounted_disks() {
+get_unmounted_disks_and_partitions() {
+    echo "=== 未挂载的磁盘 ==="
+    
     if lsblk --help 2>&1 | grep -q "\-\-output"; then
         lsblk -dpno NAME,SIZE,TYPE 2>/dev/null | awk '$3=="disk" {print $1, $2}' | while read disk size; do
-            if ! lsblk "$disk" -no MOUNTPOINT 2>/dev/null | grep -q .; then
-                local has_mounted_part=false
-                for part in $(lsblk "$disk" -lno NAME 2>/dev/null | tail -n +2); do
-                    if [[ -n $(lsblk "/dev/$part" -no MOUNTPOINT 2>/dev/null) ]]; then
-                        has_mounted_part=true
-                        break
-                    fi
-                done
-                if [[ "$has_mounted_part" == "false" ]]; then
-                    echo "$disk $size"
+            local has_mounted_part=false
+            local has_partitions=false
+            
+            for part in $(lsblk "$disk" -lno NAME,TYPE 2>/dev/null | awk '$2=="part" {print $1}'); do
+                has_partitions=true
+                if [[ -n $(lsblk "/dev/$part" -no MOUNTPOINT 2>/dev/null | grep -v '^$') ]]; then
+                    has_mounted_part=true
+                    break
                 fi
+            done
+            
+            if [[ "$has_mounted_part" == "false" ]]; then
+                local fstype=$(blkid -o value -s TYPE "$disk" 2>/dev/null)
+                if [[ -n "$fstype" ]]; then
+                    echo "DISK $disk $size $fstype"
+                elif [[ "$has_partitions" == "true" ]]; then
+                    echo "DISK $disk $size HAS_PARTITIONS"
+                else
+                    echo "DISK $disk $size NO_FS"
+                fi
+            fi
+        done
+        
+        echo "=== 未挂载的分区 ==="
+        lsblk -lno NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT 2>/dev/null | awk '$3=="part" && $5=="" {print "/dev/"$1, $2, $4}' | while read part size fstype; do
+            if [[ -n "$fstype" ]]; then
+                echo "PART $part $size $fstype"
             fi
         done
     else
@@ -116,7 +135,8 @@ get_unmounted_disks() {
                     local size=$(blockdev --getsize64 "$disk" 2>/dev/null)
                     if [[ -n "$size" ]]; then
                         local size_gb=$((size / 1024 / 1024 / 1024))
-                        echo "$disk ${size_gb}G"
+                        local fstype=$(blkid -o value -s TYPE "$disk" 2>/dev/null)
+                        echo "DISK $disk ${size_gb}G ${fstype:-NO_FS}"
                     fi
                 fi
             fi
@@ -139,52 +159,116 @@ show_disk_info() {
 }
 
 select_disk() {
-    print_info "正在检测未使用的磁盘..."
+    print_info "正在检测未使用的磁盘和分区..."
     echo ""
     
-    local unmounted_disks=$(get_unmounted_disks)
+    local all_devices=$(get_unmounted_disks_and_partitions)
     
-    if [[ -z "$unmounted_disks" ]]; then
-        print_warning "未检测到未使用的磁盘"
-        print_info "所有磁盘可能已经挂载或正在使用中"
+    local i=1
+    local device_array=()
+    local type_array=()
+    local fs_array=()
+    
+    echo "检测到以下未使用的磁盘/分区："
+    echo "========================================================"
+    printf "  %-4s %-15s %-10s %-12s %s\n" "序号" "设备" "大小" "文件系统" "状态"
+    echo "--------------------------------------------------------"
+    
+    while IFS= read -r line; do
+        if [[ "$line" == "=== "* ]] || [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        local dev_type=$(echo "$line" | awk '{print $1}')
+        local dev_name=$(echo "$line" | awk '{print $2}')
+        local dev_size=$(echo "$line" | awk '{print $3}')
+        local dev_fs=$(echo "$line" | awk '{print $4}')
+        
+        local status=""
+        local fs_display=""
+        
+        case "$dev_fs" in
+            "NO_FS")
+                status="需要格式化"
+                fs_display="-"
+                ;;
+            "HAS_PARTITIONS")
+                status="有分区(见下方)"
+                fs_display="-"
+                ;;
+            *)
+                status="可直接挂载"
+                fs_display="$dev_fs"
+                ;;
+        esac
+        
+        printf "  %-4s %-15s %-10s %-12s %s\n" "$i)" "$dev_name" "$dev_size" "$fs_display" "$status"
+        
+        device_array+=("$dev_name")
+        type_array+=("$dev_type")
+        fs_array+=("$dev_fs")
+        ((i++))
+        
+    done <<< "$all_devices"
+    
+    echo "========================================================"
+    echo ""
+    
+    if [[ ${#device_array[@]} -eq 0 ]]; then
+        print_warning "未检测到可用的未使用磁盘或分区"
         show_disk_info
         exit 1
     fi
     
-    echo "检测到以下未使用的磁盘："
-    echo "----------------------------------------"
-    
-    local i=1
-    local disk_array=()
-    
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            local disk_name=$(echo "$line" | awk '{print $1}')
-            local disk_size=$(echo "$line" | awk '{print $2}')
-            echo "  $i) $disk_name - 大小: $disk_size"
-            disk_array+=("$disk_name")
-            ((i++))
-        fi
-    done <<< "$unmounted_disks"
-    
-    if [[ ${#disk_array[@]} -eq 0 ]]; then
-        print_warning "未检测到可用的未使用磁盘"
-        exit 1
-    fi
-    
-    echo "----------------------------------------"
-    echo ""
-    
     local max_choice=$((i-1))
-    read -p "请选择要挂载的磁盘 [1-$max_choice]: " choice
+    read -p "请选择要挂载的磁盘/分区 [1-$max_choice]: " choice
     
     if ! echo "$choice" | grep -qE '^[0-9]+$' || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt "$max_choice" ]]; then
         print_error "无效的选择"
         exit 1
     fi
     
-    SELECTED_DISK="${disk_array[$((choice-1))]}"
-    print_success "已选择磁盘: $SELECTED_DISK"
+    local idx=$((choice-1))
+    SELECTED_DISK="${device_array[$idx]}"
+    local selected_type="${type_array[$idx]}"
+    local selected_fs="${fs_array[$idx]}"
+    
+    print_success "已选择: $SELECTED_DISK"
+    
+    if [[ "$selected_type" == "PART" ]]; then
+        PARTITION="$SELECTED_DISK"
+        FSTYPE="$selected_fs"
+        NEED_FORMAT=false
+        print_info "这是一个已有文件系统($FSTYPE)的分区，可以直接挂载"
+    elif [[ "$selected_fs" == "NO_FS" ]]; then
+        NEED_FORMAT=true
+        print_warning "这是一个全新磁盘，没有文件系统，需要格式化"
+    elif [[ "$selected_fs" == "HAS_PARTITIONS" ]]; then
+        print_info "该磁盘已有分区，请选择具体的分区进行挂载"
+        echo ""
+        lsblk "$SELECTED_DISK" -o NAME,SIZE,FSTYPE,MOUNTPOINT
+        echo ""
+        read -p "请输入要挂载的分区设备名 (如 ${SELECTED_DISK}1): " part_name
+        if [[ -b "$part_name" ]]; then
+            PARTITION="$part_name"
+            FSTYPE=$(blkid -o value -s TYPE "$PARTITION" 2>/dev/null)
+            if [[ -n "$FSTYPE" ]]; then
+                NEED_FORMAT=false
+                print_success "选择分区: $PARTITION (文件系统: $FSTYPE)"
+            else
+                NEED_FORMAT=true
+                print_warning "分区 $PARTITION 没有文件系统，需要格式化"
+            fi
+        else
+            print_error "无效的分区: $part_name"
+            exit 1
+        fi
+    else
+        PARTITION="$SELECTED_DISK"
+        FSTYPE="$selected_fs"
+        NEED_FORMAT=false
+        print_info "磁盘已有文件系统($FSTYPE)，可以直接挂载"
+    fi
 }
 
 get_mount_path() {
@@ -204,13 +288,27 @@ confirm_operation() {
     echo ""
     print_warning "========== 操作确认 =========="
     echo ""
-    echo "  磁盘设备: $SELECTED_DISK"
-    echo "  挂载路径: $MOUNT_PATH"
-    echo "  文件系统: ext4"
-    echo ""
-    print_warning "警告: 此操作将格式化磁盘，所有数据将被清除！"
-    echo ""
+    echo "  磁盘/分区: $SELECTED_DISK"
     
+    if [[ -n "$PARTITION" ]] && [[ "$PARTITION" != "$SELECTED_DISK" ]]; then
+        echo "  目标分区: $PARTITION"
+    fi
+    
+    echo "  挂载路径: $MOUNT_PATH"
+    
+    if [[ "$NEED_FORMAT" == "true" ]]; then
+        echo "  操作类型: 格式化后挂载"
+        echo "  文件系统: ext4 (新建)"
+        echo ""
+        print_warning "警告: 此操作将格式化磁盘，所有数据将被清除！"
+    else
+        echo "  操作类型: 直接挂载 (不格式化)"
+        echo "  文件系统: $FSTYPE (保留现有数据)"
+        echo ""
+        print_info "提示: 磁盘已有文件系统，将直接挂载，数据不会丢失"
+    fi
+    
+    echo ""
     read -p "确认执行? (yes/no): " confirm
     
     if [[ "$confirm" != "yes" ]]; then
@@ -220,6 +318,11 @@ confirm_operation() {
 }
 
 format_disk() {
+    if [[ "$NEED_FORMAT" != "true" ]]; then
+        print_info "跳过格式化 (磁盘已有文件系统)"
+        return
+    fi
+    
     print_info "正在格式化磁盘 $SELECTED_DISK ..."
     
     if command -v wipefs &> /dev/null; then
@@ -260,7 +363,21 @@ format_disk() {
     fi
     
     print_info "格式化为 ext4 文件系统..."
-    mkfs.ext4 -F "$PARTITION"
+    echo ""
+    echo "  1) 标准格式化 (执行 TRIM/Discard，对 SSD 有益，但较慢)"
+    echo "  2) 快速格式化 (跳过 Discard，速度快)"
+    echo ""
+    read -p "请选择格式化方式 [默认: 2]: " format_mode
+    
+    if [[ "$format_mode" == "1" ]]; then
+        print_info "执行标准格式化 (可能需要较长时间)..."
+        mkfs.ext4 -F "$PARTITION"
+    else
+        print_info "执行快速格式化..."
+        mkfs.ext4 -E nodiscard -F "$PARTITION"
+    fi
+    
+    FSTYPE="ext4"
     
     print_success "磁盘格式化完成"
 }
@@ -275,7 +392,7 @@ mount_disk() {
         print_warning "挂载目录已存在"
     fi
     
-    print_info "正在挂载磁盘..."
+    print_info "正在挂载 $PARTITION 到 $MOUNT_PATH ..."
     mount "$PARTITION" "$MOUNT_PATH"
     
     print_success "磁盘已挂载到 $MOUNT_PATH"
@@ -286,13 +403,21 @@ setup_fstab() {
     
     local uuid=$(blkid -s UUID -o value "$PARTITION" 2>/dev/null)
     
+    if [[ -z "$FSTYPE" ]]; then
+        FSTYPE=$(blkid -s TYPE -o value "$PARTITION" 2>/dev/null)
+    fi
+    
+    if [[ -z "$FSTYPE" ]]; then
+        FSTYPE="ext4"
+    fi
+    
     if [[ -z "$uuid" ]]; then
         print_warning "无法获取 UUID，使用设备路径配置 fstab"
-        local fstab_entry="$PARTITION  $MOUNT_PATH  ext4  defaults,noatime  0  2"
+        local fstab_entry="$PARTITION  $MOUNT_PATH  $FSTYPE  defaults,noatime  0  2"
         local check_pattern="$PARTITION"
     else
         print_info "分区 UUID: $uuid"
-        local fstab_entry="UUID=$uuid  $MOUNT_PATH  ext4  defaults,noatime  0  2"
+        local fstab_entry="UUID=$uuid  $MOUNT_PATH  $FSTYPE  defaults,noatime  0  2"
         local check_pattern="$uuid"
     fi
     
@@ -303,7 +428,6 @@ setup_fstab() {
         print_warning "fstab 中已存在该条目"
     else
         echo "" >> /etc/fstab
-        echo "# 自动添加 - $(date)" >> /etc/fstab
         echo "$fstab_entry" >> /etc/fstab
         print_success "已添加到 /etc/fstab"
     fi
@@ -321,6 +445,12 @@ show_result() {
     echo ""
     print_info "磁盘已成功挂载并配置开机自动挂载"
     print_info "挂载路径: $MOUNT_PATH"
+    
+    if [[ "$NEED_FORMAT" == "true" ]]; then
+        print_info "操作类型: 格式化后挂载 (ext4)"
+    else
+        print_info "操作类型: 直接挂载 (保留原有数据)"
+    fi
     echo ""
 }
 
